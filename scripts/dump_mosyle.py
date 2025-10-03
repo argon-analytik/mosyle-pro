@@ -1,61 +1,116 @@
 #!/usr/bin/env python3
-import os, json, time, pathlib, re, requests
+"""Download Mosyle Help Center articles as Markdown files."""
+import argparse
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+from typing import Iterable, List
+
+import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-from dotenv import load_dotenv
-
-load_dotenv()
 
 API_URL = "https://mybusiness.mosyle.com/screens/scules/support/faq/article.php"
-PAYLOAD_STATIC = {
-    "usertab_current_os":        os.getenv("MDEVICE_OS", "mac"),
-    "usertab_current_idcompany": os.getenv("MDEVICE_IDCOMPANY", "").strip()
-}
-COOKIES = {"PHPSESSID": os.getenv("MDEVICE_PHPSESSID", "").strip()}
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "X-Requested-With": "XMLHttpRequest",
-    "Accept": "*/*",
-}
+USER_AGENT = "Mozilla/5.0"
+DEFAULT_SLEEP = 0.3
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-ART_DIR = ROOT / "articles_md"
-ART_DIR.mkdir(exist_ok=True)
 
-ids_path = ROOT / "ids.json"
-if not ids_path.exists():
-    raise SystemExit("ids.json not found. Create it from the browser console first.")
+def read_ids(path: pathlib.Path) -> List[str]:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Failed to parse {path}: {exc}") from exc
+    if not isinstance(data, Iterable):
+        raise SystemExit(f"Expected a list of IDs in {path}")
+    return [str(item) for item in data if str(item).strip()]
 
-ids = json.load(open(ids_path, "r", encoding="utf-8"))
-ids = [str(x) for x in ids]
 
-def fetch_one(art_id, tries=5, backoff=0.8):
-    for i in range(tries):
-        r = requests.post(API_URL,
-                          data={**PAYLOAD_STATIC, "idarticle": art_id},
-                          headers=HEADERS, cookies=COOKIES, timeout=30)
-        if r.status_code not in (429, 500, 502, 503, 504):
-            return r
-        time.sleep(backoff * (2 ** i))
-    r.raise_for_status()
-    return r
+def build_session() -> requests.Session:
+    phpsessid = os.getenv("MOS_PHPSESSID", "").strip()
+    idcompany = os.getenv("MOS_IDCOMPANY", "").strip()
+    if not phpsessid or not idcompany:
+        raise SystemExit("Set MOS_PHPSESSID and MOS_IDCOMPANY environment variables before running.")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    session.cookies.set("PHPSESSID", phpsessid)
+    session.params = {}
+    session_payload = {
+        "usertab_current_os": "mac",
+        "usertab_current_idcompany": idcompany,
+    }
+    session.session_payload = session_payload  # type: ignore[attr-defined]
+    return session
 
-for art_id in tqdm(ids, unit="article"):
-    r = fetch_one(art_id)
-    ct = r.headers.get("content-type", "")
-    html = r.json().get("html") if ct.startswith("application/json") else r.text
 
+def sanitize_title(title: str) -> str:
+    cleaned = re.sub(r"[<>:\"/\\|?*]", "_", title)
+    return cleaned[:150]
+
+
+def write_markdown(output_dir: pathlib.Path, article_id: str, title: str, body: str) -> pathlib.Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{article_id} – {sanitize_title(title)}.md"
+    path = output_dir / filename
+    if path.exists():
+        return path
+    path.write_text(f"# {title}\n\n{body}", encoding="utf-8")
+    return path
+
+
+def extract_article_content(html: str, fallback_title: str) -> tuple[str, str]:
     soup = BeautifulSoup(html, "lxml")
     title_el = soup.select_one(".title, h1, h2")
-    title = title_el.get_text(strip=True) if title_el else f"Article {art_id}"
-    body  = soup.get_text("\n", strip=True)
+    title = title_el.get_text(strip=True) if title_el else fallback_title
+    body = soup.get_text("\n", strip=True)
+    return title or fallback_title, body
 
-    safe = re.sub(r'[<>:"/\\|?*]', '_', title)[:150]
-    target = ART_DIR / f"{art_id} – {safe}.md"
-    if target.exists():
-        continue
-    target.write_text(f"# {title}\n\n{body}", encoding="utf-8")
-    time.sleep(0.3)
 
-print(str(ART_DIR.resolve()))
+def download_articles(ids: List[str], output_dir: pathlib.Path, sleep: float) -> None:
+    session = build_session()
+    payload_static = session.session_payload  # type: ignore[attr-defined]
+
+    for article_id in tqdm(ids, unit="article"):
+        payload = dict(payload_static, idarticle=article_id)
+        response = session.post(API_URL, data=payload, timeout=30)
+        response.raise_for_status()
+        if response.headers.get("content-type", "").startswith("application/json"):
+            data = response.json()
+            html = data.get("html", "") if isinstance(data, dict) else ""
+        else:
+            html = response.text
+        title, body = extract_article_content(html, f"Article {article_id}")
+        write_markdown(output_dir, article_id, title, body)
+        time.sleep(sleep)
+
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("ids", type=pathlib.Path, help="Path to ids.json")
+    parser.add_argument("--output", "-o", type=pathlib.Path, default=pathlib.Path("articles_md"),
+                        help="Directory to write Markdown files")
+    parser.add_argument("--sleep", type=float, default=DEFAULT_SLEEP,
+                        help="Delay between requests in seconds (default: %(default)s)")
+    return parser.parse_args(argv)
+
+
+def main(argv: List[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    ids = read_ids(args.ids)
+    if not ids:
+        raise SystemExit(f"No article IDs found in {args.ids}")
+    download_articles(ids, args.output, args.sleep)
+    print(args.output.resolve())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
